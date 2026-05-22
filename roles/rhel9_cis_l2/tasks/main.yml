@@ -1,0 +1,284 @@
+---
+- name: Enforce optional managed host guardrail
+  ansible.builtin.assert:
+    that:
+      - ansible_host is match(rhel9_cis_l2_allowed_host_regex)
+    fail_msg: "Refusing to touch {{ inventory_hostname }} because ansible_host does not match rhel9_cis_l2_allowed_host_regex."
+  when: rhel9_cis_l2_allowed_host_regex | length > 0
+
+- name: Assert this role is running on an allowed RHEL 9 target
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution in rhel9_cis_l2_allowed_distributions
+      - ansible_distribution_major_version == "9"
+    fail_msg: "CIS Level 2 role expects an allowed RHEL 9 target, got {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+- name: Install OpenSCAP and baseline hardening packages
+  ansible.builtin.dnf:
+    name: "{{ rhel9_cis_l2_packages }}"
+    state: present
+    update_cache: true
+
+- name: Ensure CIS report directory exists on the managed host
+  ansible.builtin.file:
+    path: "{{ rhel9_cis_l2_report_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Locate an installed SCAP datastream for RHEL 9
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ rhel9_cis_l2_datastream_candidates }}"
+  register: rhel9_cis_l2_datastream_stats
+
+- name: Select the first available SCAP datastream
+  ansible.builtin.set_fact:
+    rhel9_cis_l2_datastream: "{{ (rhel9_cis_l2_datastream_stats.results | selectattr('stat.exists') | map(attribute='item') | list | first) | default('') }}"
+
+- name: Fail when no RHEL 9 SCAP datastream is installed
+  ansible.builtin.fail:
+    msg: "No RHEL 9 SCAP datastream found. Check rhel9_cis_l2_datastream_candidates."
+  when: rhel9_cis_l2_datastream | length == 0
+
+- name: Read available SCAP profiles
+  ansible.builtin.command:
+    argv:
+      - oscap
+      - info
+      - "{{ rhel9_cis_l2_datastream }}"
+  register: rhel9_cis_l2_oscap_info
+  changed_when: false
+
+- name: Select CIS Level 2 profile
+  ansible.builtin.set_fact:
+    rhel9_cis_l2_profile: "{{ item }}"
+  loop: "{{ rhel9_cis_l2_profile_candidates }}"
+  when:
+    - rhel9_cis_l2_profile is not defined
+    - item in rhel9_cis_l2_oscap_info.stdout
+
+- name: Fail when CIS Level 2 profile is unavailable
+  ansible.builtin.fail:
+    msg: "No CIS Level 2 profile found in {{ rhel9_cis_l2_datastream }}"
+  when: rhel9_cis_l2_profile is not defined
+
+- name: Set report file paths
+  ansible.builtin.set_fact:
+    rhel9_cis_l2_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    rhel9_cis_l2_pre_arf: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-pre-{{ ansible_date_time.iso8601_basic_short }}.arf.xml"
+    rhel9_cis_l2_pre_html: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-pre-{{ ansible_date_time.iso8601_basic_short }}.html"
+    rhel9_cis_l2_remediate_arf: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-remediate-{{ ansible_date_time.iso8601_basic_short }}.arf.xml"
+    rhel9_cis_l2_remediate_html: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-remediate-{{ ansible_date_time.iso8601_basic_short }}.html"
+    rhel9_cis_l2_post_arf: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-post-{{ ansible_date_time.iso8601_basic_short }}.arf.xml"
+    rhel9_cis_l2_post_html: "{{ rhel9_cis_l2_report_root }}/{{ inventory_hostname }}-post-{{ ansible_date_time.iso8601_basic_short }}.html"
+
+- name: Run pre-hardening CIS scan
+  ansible.builtin.command:
+    argv:
+      - oscap
+      - xccdf
+      - eval
+      - --profile
+      - "{{ rhel9_cis_l2_profile }}"
+      - --results-arf
+      - "{{ rhel9_cis_l2_pre_arf }}"
+      - --report
+      - "{{ rhel9_cis_l2_pre_html }}"
+      - "{{ rhel9_cis_l2_datastream }}"
+  register: rhel9_cis_l2_pre_scan
+  failed_when: rhel9_cis_l2_pre_scan.rc not in [0, 2]
+  changed_when: false
+
+- name: Apply CIS Level 2 remediation
+  ansible.builtin.shell: |
+    set +e
+    oscap xccdf eval \
+      --remediate \
+      --profile "{{ rhel9_cis_l2_profile }}" \
+      --results-arf "{{ rhel9_cis_l2_remediate_arf }}" \
+      --report "{{ rhel9_cis_l2_remediate_html }}" \
+      "{{ rhel9_cis_l2_datastream }}"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+      exit "$rc"
+    fi
+
+    {% if rhel9_cis_l2_preserve_ansible_user | bool %}
+    install -d -o "{{ rhel9_cis_l2_ansible_user }}" -g "{{ rhel9_cis_l2_ansible_user }}" -m 0700 "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh"
+    install -d -o "{{ rhel9_cis_l2_ansible_user }}" -g "{{ rhel9_cis_l2_ansible_user }}" -m 0700 "/home/{{ rhel9_cis_l2_ansible_user }}/.ansible/tmp"
+    cat > "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh/authorized_keys" <<'RHEL_CIS_AUTHORIZED_KEY'
+    {{ lookup('file', rhel9_cis_l2_public_key_path) }}
+    RHEL_CIS_AUTHORIZED_KEY
+    chown "{{ rhel9_cis_l2_ansible_user }}:{{ rhel9_cis_l2_ansible_user }}" "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh/authorized_keys"
+    chmod 0600 "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh/authorized_keys"
+
+    cat > /etc/sudoers.d/90-rhel9-cis-ansible <<'RHEL_CIS_SUDOERS'
+    {% if rhel9_cis_l2_ansible_sudo_nopasswd | bool %}
+    {{ rhel9_cis_l2_ansible_user }} ALL=(ALL) NOPASSWD: ALL
+    {% else %}
+    {{ rhel9_cis_l2_ansible_user }} ALL=(ALL) ALL
+    {% endif %}
+    RHEL_CIS_SUDOERS
+    chmod 0440 /etc/sudoers.d/90-rhel9-cis-ansible
+    visudo -cf /etc/sudoers.d/90-rhel9-cis-ansible
+
+    cat > /etc/ssh/sshd_config.d/99-rhel9-cis-ansible-key.conf <<'RHEL_CIS_SSHD'
+    PubkeyAuthentication yes
+    PasswordAuthentication no
+    AuthorizedKeysFile .ssh/authorized_keys
+    {% if rhel9_cis_l2_ssh_allow_users | length > 0 %}
+    AllowUsers {{ rhel9_cis_l2_ssh_allow_users | join(' ') }}
+    {% endif %}
+    RHEL_CIS_SSHD
+    sshd -t
+    systemctl restart sshd
+    {% endif %}
+
+    exit "$rc"
+  register: rhel9_cis_l2_remediation
+  failed_when: rhel9_cis_l2_remediation.rc not in [0, 2]
+  changed_when: true
+  when: rhel9_cis_l2_remediate | bool
+
+- name: Preserve automation SSH configuration after remediation
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-rhel9-cis-ansible-key.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      PubkeyAuthentication yes
+      PasswordAuthentication no
+      AuthorizedKeysFile .ssh/authorized_keys
+      {% if rhel9_cis_l2_ssh_allow_users | length > 0 %}
+      AllowUsers {{ rhel9_cis_l2_ssh_allow_users | join(' ') }}
+      {% endif %}
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Ensure automation SSH directory exists after remediation
+  ansible.builtin.file:
+    path: "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh"
+    state: directory
+    owner: "{{ rhel9_cis_l2_ansible_user }}"
+    group: "{{ rhel9_cis_l2_ansible_user }}"
+    mode: "0700"
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Ensure automation public key remains installed after remediation
+  ansible.builtin.copy:
+    dest: "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh/authorized_keys"
+    owner: "{{ rhel9_cis_l2_ansible_user }}"
+    group: "{{ rhel9_cis_l2_ansible_user }}"
+    mode: "0600"
+    content: "{{ lookup('file', rhel9_cis_l2_public_key_path) }}\n"
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Ensure automation user keeps sudo after remediation
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/90-rhel9-cis-ansible
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+    content: |
+      {% if rhel9_cis_l2_ansible_sudo_nopasswd | bool %}
+      {{ rhel9_cis_l2_ansible_user }} ALL=(ALL) NOPASSWD: ALL
+      {% else %}
+      {{ rhel9_cis_l2_ansible_user }} ALL=(ALL) ALL
+      {% endif %}
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Restore labels on automation access files after remediation
+  ansible.builtin.command:
+    argv:
+      - restorecon
+      - -Rv
+      - "/home/{{ rhel9_cis_l2_ansible_user }}/.ssh"
+      - /etc/ssh/sshd_config.d
+      - /etc/sudoers.d
+  register: rhel9_cis_l2_restorecon
+  changed_when: "'restorecon reset' in rhel9_cis_l2_restorecon.stdout"
+  failed_when: rhel9_cis_l2_restorecon.rc not in [0, 255]
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Validate sshd configuration after remediation
+  ansible.builtin.command:
+    argv:
+      - sshd
+      - -t
+  changed_when: false
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Restart sshd after remediation
+  ansible.builtin.service:
+    name: sshd
+    state: restarted
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_preserve_ansible_user | bool
+
+- name: Reboot after remediation
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+    connect_timeout: 20
+    post_reboot_delay: 20
+  when:
+    - rhel9_cis_l2_remediate | bool
+    - rhel9_cis_l2_reboot_after_remediation | bool
+
+- name: Refresh facts after hardening reboot
+  ansible.builtin.setup:
+
+- name: Run post-hardening CIS scan
+  ansible.builtin.command:
+    argv:
+      - oscap
+      - xccdf
+      - eval
+      - --profile
+      - "{{ rhel9_cis_l2_profile }}"
+      - --results-arf
+      - "{{ rhel9_cis_l2_post_arf }}"
+      - --report
+      - "{{ rhel9_cis_l2_post_html }}"
+      - "{{ rhel9_cis_l2_datastream }}"
+  register: rhel9_cis_l2_post_scan
+  failed_when: rhel9_cis_l2_post_scan.rc not in [0, 2]
+  changed_when: false
+
+- name: Ensure controller report directory exists
+  ansible.builtin.file:
+    path: "{{ rhel9_cis_l2_controller_report_root }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+
+- name: Fetch CIS reports to the controller
+  ansible.builtin.fetch:
+    src: "{{ item }}"
+    dest: "{{ rhel9_cis_l2_controller_report_root }}/{{ inventory_hostname }}/"
+    flat: true
+  loop:
+    - "{{ rhel9_cis_l2_pre_arf }}"
+    - "{{ rhel9_cis_l2_pre_html }}"
+    - "{{ rhel9_cis_l2_remediate_arf }}"
+    - "{{ rhel9_cis_l2_remediate_html }}"
+    - "{{ rhel9_cis_l2_post_arf }}"
+    - "{{ rhel9_cis_l2_post_html }}"
+  when: item is defined

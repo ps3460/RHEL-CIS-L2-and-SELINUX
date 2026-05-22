@@ -1,0 +1,28 @@
+---
+rhel9_cis_l2_profile_candidates:
+  - xccdf_org.ssgproject.content_profile_cis_server_l2
+  - xccdf_org.ssgproject.content_profile_cis
+
+rhel9_cis_l2_datastream_candidates:
+  - /usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml
+
+rhel9_cis_l2_report_root: /var/log/rhel9-cis-l2
+rhel9_cis_l2_controller_report_root: "{{ playbook_dir }}/../reports"
+rhel9_cis_l2_remediate: true
+rhel9_cis_l2_reboot_after_remediation: true
+rhel9_cis_l2_preserve_ansible_user: true
+rhel9_cis_l2_ansible_user: "{{ ansible_user | default('ansible') }}"
+rhel9_cis_l2_public_key_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+rhel9_cis_l2_ansible_sudo_nopasswd: false
+rhel9_cis_l2_ssh_allow_users: []
+rhel9_cis_l2_allowed_distributions:
+  - RedHat
+rhel9_cis_l2_allowed_host_regex: ""
+
+rhel9_cis_l2_packages:
+  - openscap-scanner
+  - scap-security-guide
+  - audit
+  - aide
+  - firewalld
+  - chrony

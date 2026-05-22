@@ -1,0 +1,230 @@
+---
+- name: Set and verify SELinux enforcing mode on RHEL 9 hosts
+  hosts: rhel9_cis_targets
+  gather_facts: true
+  become: true
+  vars:
+    selinux_enforcing_evidence_root: "{{ playbook_dir }}/../reports/{{ inventory_hostname }}/selinux"
+    selinux_enforcing_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    selinux_enforcing_allowed_failed_services: []
+    selinux_enforcing_force_relabel: false
+    selinux_enforcing_reboot_timeout: 900
+  tasks:
+    - name: Assert this playbook is running on RHEL 9
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "RedHat"
+          - ansible_distribution_major_version == "9"
+        fail_msg: "SELinux enforcing workflow expects RHEL 9, got {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Ensure controller SELinux evidence directory exists
+      ansible.builtin.file:
+        path: "{{ selinux_enforcing_evidence_root }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Capture pre-enforcement SELinux state
+      ansible.builtin.command:
+        argv:
+          - getenforce
+      register: selinux_enforcing_pre_getenforce
+      changed_when: false
+
+    - name: Persist SELinux enforcing mode
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: "^SELINUX="
+        line: SELINUX=enforcing
+
+    - name: Restore labels on automation access files before enforcing
+      ansible.builtin.command:
+        argv:
+          - restorecon
+          - -Rv
+          - "/home/{{ ansible_user }}/.ssh"
+          - /etc/ssh/sshd_config.d
+          - /etc/sudoers.d
+      register: selinux_enforcing_restorecon
+      changed_when: "'restorecon reset' in selinux_enforcing_restorecon.stdout"
+      failed_when: selinux_enforcing_restorecon.rc not in [0, 255]
+
+    - name: Request full filesystem relabel when explicitly enabled
+      ansible.builtin.file:
+        path: /.autorelabel
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+      when: selinux_enforcing_force_relabel | bool
+
+    - name: Apply SELinux enforcing runtime mode
+      ansible.builtin.command:
+        argv:
+          - setenforce
+          - "1"
+      register: selinux_enforcing_setenforce
+      changed_when: selinux_enforcing_pre_getenforce.stdout != "Enforcing"
+      failed_when: selinux_enforcing_setenforce.rc != 0
+
+    - name: Reboot after SELinux enforcing change
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ selinux_enforcing_reboot_timeout }}"
+        connect_timeout: 20
+        post_reboot_delay: 20
+
+    - name: Refresh facts after enforcing reboot
+      ansible.builtin.setup:
+
+    - name: Verify privilege escalation after enforcing reboot
+      ansible.builtin.command:
+        argv:
+          - whoami
+      become: true
+      register: selinux_enforcing_whoami
+      changed_when: false
+
+    - name: Capture SELinux runtime mode
+      ansible.builtin.command:
+        argv:
+          - getenforce
+      register: selinux_enforcing_getenforce
+      changed_when: false
+
+    - name: Capture SELinux status
+      ansible.builtin.command:
+        argv:
+          - sestatus
+      register: selinux_enforcing_sestatus
+      changed_when: false
+
+    - name: Capture failed systemd services
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --failed
+          - --no-pager
+          - --plain
+          - --no-legend
+      register: selinux_enforcing_failed_services
+      changed_when: false
+      failed_when: false
+
+    - name: Capture AVC audit events since boot
+      ansible.builtin.command:
+        argv:
+          - ausearch
+          - -m
+          - AVC,USER_AVC
+          - -ts
+          - boot
+      register: selinux_enforcing_avc_events
+      changed_when: false
+      failed_when: selinux_enforcing_avc_events.rc not in [0, 1]
+
+    - name: Capture firewalld runtime state
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --state
+      register: selinux_enforcing_firewalld_state
+      changed_when: false
+
+    - name: Capture auditd service state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - auditd
+      register: selinux_enforcing_auditd_state
+      changed_when: false
+      failed_when: false
+
+    - name: Assert SELinux is enforcing
+      ansible.builtin.assert:
+        that:
+          - selinux_enforcing_getenforce.stdout == "Enforcing"
+          - "'Current mode:                   enforcing' in selinux_enforcing_sestatus.stdout"
+        fail_msg: "SELinux is not enforcing after reboot."
+
+    - name: Assert audit and firewall baseline services are active
+      ansible.builtin.assert:
+        that:
+          - selinux_enforcing_firewalld_state.stdout == "running"
+          - selinux_enforcing_auditd_state.stdout == "active"
+        fail_msg: "firewalld and auditd must be active."
+
+    - name: Derive unexpected failed service list
+      ansible.builtin.set_fact:
+        selinux_enforcing_unexpected_failed_services: >-
+          {{
+            selinux_enforcing_failed_services.stdout_lines
+            | map('regex_replace', '^\\s*([^\\s]+).*$', '\\1')
+            | reject('in', selinux_enforcing_allowed_failed_services)
+            | list
+          }}
+
+    - name: Assert no unexpected failed systemd services remain
+      ansible.builtin.assert:
+        that:
+          - selinux_enforcing_unexpected_failed_services | length == 0
+        fail_msg: "Unexpected failed services: {{ selinux_enforcing_unexpected_failed_services | join(', ') }}"
+
+    - name: Write SELinux state evidence on the controller
+      ansible.builtin.copy:
+        dest: "{{ selinux_enforcing_evidence_root }}/{{ inventory_hostname }}-selinux-{{ selinux_enforcing_timestamp }}.txt"
+        mode: "0640"
+        content: |
+          host={{ inventory_hostname }}
+          ansible_host={{ ansible_host | default('') }}
+          timestamp={{ selinux_enforcing_timestamp }}
+
+          # pre-enforcement getenforce
+          {{ selinux_enforcing_pre_getenforce.stdout }}
+
+          # post-enforcement getenforce
+          {{ selinux_enforcing_getenforce.stdout }}
+
+          # sestatus
+          {{ selinux_enforcing_sestatus.stdout }}
+      delegate_to: localhost
+      become: false
+
+    - name: Write service state evidence on the controller
+      ansible.builtin.copy:
+        dest: "{{ selinux_enforcing_evidence_root }}/{{ inventory_hostname }}-services-{{ selinux_enforcing_timestamp }}.txt"
+        mode: "0640"
+        content: |
+          host={{ inventory_hostname }}
+          ansible_host={{ ansible_host | default('') }}
+          timestamp={{ selinux_enforcing_timestamp }}
+
+          # whoami through become
+          {{ selinux_enforcing_whoami.stdout }}
+
+          # firewalld
+          {{ selinux_enforcing_firewalld_state.stdout }}
+
+          # auditd
+          {{ selinux_enforcing_auditd_state.stdout }}
+
+          # systemctl --failed
+          {{ selinux_enforcing_failed_services.stdout | default('') }}
+      delegate_to: localhost
+      become: false
+
+    - name: Write AVC evidence on the controller
+      ansible.builtin.copy:
+        dest: "{{ selinux_enforcing_evidence_root }}/{{ inventory_hostname }}-avc-{{ selinux_enforcing_timestamp }}.txt"
+        mode: "0640"
+        content: |
+          host={{ inventory_hostname }}
+          ansible_host={{ ansible_host | default('') }}
+          timestamp={{ selinux_enforcing_timestamp }}
+          ausearch_rc={{ selinux_enforcing_avc_events.rc }}
+
+          {{ selinux_enforcing_avc_events.stdout | default('') }}
+          {{ selinux_enforcing_avc_events.stderr | default('') }}
+      delegate_to: localhost
+      become: false

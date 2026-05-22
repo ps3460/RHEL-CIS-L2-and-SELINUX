@@ -1,0 +1,81 @@
+---
+- name: Bootstrap non-root Ansible user for RHEL 9
+  hosts: rhel9_cis_targets
+  gather_facts: true
+  become: true
+  vars:
+    rhel9_bootstrap_user: ansible
+    rhel9_bootstrap_public_key_path: "{{ lookup('env', 'HOME') }}/.ssh/id_ed25519.pub"
+    rhel9_bootstrap_sudo_nopasswd: true
+    rhel9_bootstrap_allowed_distributions:
+      - RedHat
+  tasks:
+    - name: Assert this bootstrap is running on an allowed RHEL 9 target
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in rhel9_bootstrap_allowed_distributions
+          - ansible_distribution_major_version == "9"
+        fail_msg: "Bootstrap expects an allowed RHEL 9 target, got {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Ensure sudo is installed
+      ansible.builtin.dnf:
+        name: sudo
+        state: present
+
+    - name: Ensure automation user exists
+      ansible.builtin.user:
+        name: "{{ rhel9_bootstrap_user }}"
+        comment: Ansible automation user
+        groups: wheel
+        append: true
+        create_home: true
+        shell: /bin/bash
+
+    - name: Ensure automation SSH directory exists
+      ansible.builtin.file:
+        path: "/home/{{ rhel9_bootstrap_user }}/.ssh"
+        state: directory
+        owner: "{{ rhel9_bootstrap_user }}"
+        group: "{{ rhel9_bootstrap_user }}"
+        mode: "0700"
+
+    - name: Ensure automation remote temporary directory exists
+      ansible.builtin.file:
+        path: "/home/{{ rhel9_bootstrap_user }}/.ansible/tmp"
+        state: directory
+        owner: "{{ rhel9_bootstrap_user }}"
+        group: "{{ rhel9_bootstrap_user }}"
+        mode: "0700"
+
+    - name: Install controller public key for automation user
+      ansible.builtin.copy:
+        dest: "/home/{{ rhel9_bootstrap_user }}/.ssh/authorized_keys"
+        owner: "{{ rhel9_bootstrap_user }}"
+        group: "{{ rhel9_bootstrap_user }}"
+        mode: "0600"
+        content: "{{ lookup('file', rhel9_bootstrap_public_key_path) }}\n"
+
+    - name: Configure sudo for automation user
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-rhel9-cis-ansible
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          {% if rhel9_bootstrap_sudo_nopasswd | bool %}
+          {{ rhel9_bootstrap_user }} ALL=(ALL) NOPASSWD: ALL
+          {% else %}
+          {{ rhel9_bootstrap_user }} ALL=(ALL) ALL
+          {% endif %}
+
+    - name: Validate sudo path for automation user
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - -l
+          - -U
+          - "{{ rhel9_bootstrap_user }}"
+      changed_when: false
+      failed_when: false
